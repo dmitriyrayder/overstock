@@ -3,3 +3,7 @@ pandas
 numpy
 prophet
 sklearn
+numpy
+plotly
+prophet
+openpyxl
