@@ -2,7 +2,7 @@ streamlit
 pandas
 numpy
 prophet
-sklearn
+scikit-learn<1.4.0
 numpy
 plotly
 prophet
