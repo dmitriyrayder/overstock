@@ -1,12 +1,20 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from prophet import Prophet
+import warnings
+warnings.filterwarnings('ignore')
+
+# Условный импорт Prophet
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except ImportError:
+    PROPHET_AVAILABLE = False
+    st.warning("⚠️ Prophet не установлен. Прогнозы будут недоступны.")
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
-import warnings
-warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="Анализ товаров", layout="wide")
 
@@ -31,6 +39,10 @@ with st.sidebar:
 
 # === ЗАГРУЗКА ДАННЫХ ===
 st.header("📁 Загрузка данных")
+
+# Добавляем примечание о формате файла
+st.info("💡 Убедитесь, что ваш Excel файл содержит колонки: дата, артикул, количество, магазин, название")
+
 uploaded_file = st.file_uploader("Выберите Excel файл", type=['xlsx', 'xls'])
 
 df = None
@@ -38,6 +50,14 @@ data_loaded = False
 
 if uploaded_file is not None:
     try:
+        # Ограничиваем размер файла
+        file_size = len(uploaded_file.read())
+        uploaded_file.seek(0)  # Возвращаем указатель в начало
+        
+        if file_size > 50 * 1024 * 1024:  # 50MB лимит
+            st.error("❌ Файл слишком большой. Максимальный размер: 50MB")
+            st.stop()
+        
         excel_file = pd.ExcelFile(uploaded_file)
         sheet_names = excel_file.sheet_names
         
@@ -46,12 +66,17 @@ if uploaded_file is not None:
         else:
             selected_sheet = sheet_names[0]
         
-        df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+        # Ограничиваем количество строк для чтения
+        df = pd.read_excel(uploaded_file, sheet_name=selected_sheet, nrows=100000)
+        
+        if len(df) == 100000:
+            st.warning("⚠️ Файл обрезан до 100,000 строк для обработки")
+        
         st.success(f"✅ Загружено {len(df)} строк из листа '{selected_sheet}'")
         
         st.subheader("🔍 Проверка структуры данных")
         available_cols = list(df.columns)
-        st.write(f"**Найденные колонки:** {', '.join(available_cols)}")
+        st.write(f"**Найденные колонки:** {', '.join(available_cols[:10])}{'...' if len(available_cols) > 10 else ''}")
         
         col1, col2 = st.columns(2)
         
@@ -134,15 +159,19 @@ if uploaded_file is not None:
                 with col2:
                     st.metric("Уникальных артикулов", df['Art'].nunique())
                 with col3:
-                    date_range_min = pd.to_datetime(df['Data'], errors='coerce').min()
-                    date_range_max = pd.to_datetime(df['Data'], errors='coerce').max()
-                    if pd.notna(date_range_min) and pd.notna(date_range_max):
-                        st.metric("Период данных", f"{date_range_min.strftime('%Y-%m-%d')} - {date_range_max.strftime('%Y-%m-%d')}")
-                    else:
-                        st.metric("Период данных", "Проверьте формат дат")
+                    try:
+                        date_range_min = pd.to_datetime(df['Data'], errors='coerce').min()
+                        date_range_max = pd.to_datetime(df['Data'], errors='coerce').max()
+                        if pd.notna(date_range_min) and pd.notna(date_range_max):
+                            st.metric("Период данных", f"{date_range_min.strftime('%Y-%m-%d')} - {date_range_max.strftime('%Y-%m-%d')}")
+                        else:
+                            st.metric("Период данных", "Проверьте формат дат")
+                    except:
+                        st.metric("Период данных", "Ошибка в датах")
             
     except Exception as e:
-        st.error(f"❌ Ошибка загрузки файла: {e}")
+        st.error(f"❌ Ошибка загрузки файла: {str(e)}")
+        st.info("💡 Попробуйте загрузить файл меньшего размера или проверьте его формат")
         st.stop()
 else:
     st.info("👆 Загрузите Excel файл для начала работы")
@@ -159,183 +188,226 @@ else:
     st.stop()
 
 # === ОБРАБОТКА ===
-with st.spinner("🔄 Обработка данных..."):
-    df['Data'] = pd.to_datetime(df['Data'], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['Data'])
-    df = df[df['Qty'] >= 0]
-    df['year_week'] = df['Data'].dt.strftime('%Y-%U')
-    
-    # Агрегация по неделям
-    weekly = df.groupby(['Art', 'year_week'])[['Qty']].sum().reset_index()
-    unique_weeks = sorted(df['year_week'].unique())
-    all_arts = df['Art'].unique()
-    all_weeks = pd.MultiIndex.from_product([all_arts, unique_weeks], names=['Art', 'year_week'])
-    weekly = weekly.set_index(['Art', 'year_week']).reindex(all_weeks, fill_value=0).reset_index()
-    
-    # ABC-анализ товаров
-    abc_analysis = df.groupby('Art').agg({
-        'Qty': ['sum', 'mean', 'count'],
-        'Data': ['min', 'max']
-    }).reset_index()
-    
-    abc_analysis.columns = ['Art', 'total_qty', 'avg_qty', 'sales_count', 'first_sale', 'last_sale']
-    abc_analysis['days_in_catalog'] = (abc_analysis['last_sale'] - abc_analysis['first_sale']).dt.days + 1
-    abc_analysis['sales_velocity'] = abc_analysis['total_qty'] / np.maximum(abc_analysis['days_in_catalog'], 1)
-    
-    abc_analysis = abc_analysis.sort_values('total_qty', ascending=False)
-    abc_analysis['cum_qty'] = abc_analysis['total_qty'].cumsum()
-    abc_analysis['cum_qty_pct'] = abc_analysis['cum_qty'] / abc_analysis['total_qty'].sum()
-    
-    def get_abc_category(cum_pct):
-        if cum_pct <= 0.8:
-            return 'A'
-        elif cum_pct <= 0.95:
-            return 'B'
-        else:
-            return 'C'
-    
-    abc_analysis['abc_category'] = abc_analysis['cum_qty_pct'].apply(get_abc_category)
-    
-    # Расчет улучшенных фичей
-    def compute_enhanced_features(group):
-        sorted_group = group.sort_values('year_week')
-        qty_series = sorted_group['Qty']
+try:
+    with st.spinner("🔄 Обработка данных..."):
+        # Очистка данных с дополнительной проверкой
+        df['Data'] = pd.to_datetime(df['Data'], dayfirst=True, errors='coerce')
+        df = df.dropna(subset=['Data'])
+        df = df[df['Qty'] >= 0]
         
-        ma_3 = qty_series.rolling(3, min_periods=1).mean().iloc[-1]
-        ma_6 = qty_series.rolling(6, min_periods=1).mean().iloc[-1]
-        ma_12 = qty_series.rolling(12, min_periods=1).mean().iloc[-1]
+        # Проверяем, что есть данные после очистки
+        if len(df) == 0:
+            st.error("❌ Нет валидных данных после очистки")
+            st.stop()
         
-        consecutive_zeros = 0
-        for val in reversed(qty_series.values):
-            if val == 0:
-                consecutive_zeros += 1
+        df['year_week'] = df['Data'].dt.strftime('%Y-%U')
+        
+        # Агрегация по неделям с ограничением памяти
+        weekly = df.groupby(['Art', 'year_week'])[['Qty']].sum().reset_index()
+        unique_weeks = sorted(df['year_week'].unique())
+        all_arts = df['Art'].unique()
+        
+        # Ограничиваем количество артикулов для обработки
+        if len(all_arts) > 10000:
+            st.warning("⚠️ Слишком много артикулов. Обрабатываем топ-10000 по продажам.")
+            top_arts = df.groupby('Art')['Qty'].sum().nlargest(10000).index
+            all_arts = top_arts
+            df = df[df['Art'].isin(all_arts)]
+            weekly = weekly[weekly['Art'].isin(all_arts)]
+        
+        all_weeks = pd.MultiIndex.from_product([all_arts, unique_weeks], names=['Art', 'year_week'])
+        weekly = weekly.set_index(['Art', 'year_week']).reindex(all_weeks, fill_value=0).reset_index()
+        
+        # ABC-анализ товаров
+        abc_analysis = df.groupby('Art').agg({
+            'Qty': ['sum', 'mean', 'count'],
+            'Data': ['min', 'max']
+        }).reset_index()
+        
+        abc_analysis.columns = ['Art', 'total_qty', 'avg_qty', 'sales_count', 'first_sale', 'last_sale']
+        abc_analysis['days_in_catalog'] = (abc_analysis['last_sale'] - abc_analysis['first_sale']).dt.days + 1
+        abc_analysis['sales_velocity'] = abc_analysis['total_qty'] / np.maximum(abc_analysis['days_in_catalog'], 1)
+        
+        abc_analysis = abc_analysis.sort_values('total_qty', ascending=False)
+        abc_analysis['cum_qty'] = abc_analysis['total_qty'].cumsum()
+        abc_analysis['cum_qty_pct'] = abc_analysis['cum_qty'] / abc_analysis['total_qty'].sum()
+        
+        def get_abc_category(cum_pct):
+            if cum_pct <= 0.8:
+                return 'A'
+            elif cum_pct <= 0.95:
+                return 'B'
             else:
-                break
+                return 'C'
         
-        zero_weeks_12 = (qty_series.tail(12) == 0).sum()
+        abc_analysis['abc_category'] = abc_analysis['cum_qty_pct'].apply(get_abc_category)
         
-        if len(qty_series) >= 4:
-            x = np.arange(len(qty_series))
-            trend = np.polyfit(x, qty_series, 1)[0]
+        # Расчет улучшенных фичей
+        def compute_enhanced_features(group):
+            sorted_group = group.sort_values('year_week')
+            qty_series = sorted_group['Qty']
+            
+            ma_3 = qty_series.rolling(3, min_periods=1).mean().iloc[-1] if len(qty_series) > 0 else 0
+            ma_6 = qty_series.rolling(6, min_periods=1).mean().iloc[-1] if len(qty_series) > 0 else 0
+            ma_12 = qty_series.rolling(12, min_periods=1).mean().iloc[-1] if len(qty_series) > 0 else 0
+            
+            consecutive_zeros = 0
+            for val in reversed(qty_series.values):
+                if val == 0:
+                    consecutive_zeros += 1
+                else:
+                    break
+            
+            zero_weeks_12 = (qty_series.tail(12) == 0).sum()
+            
+            if len(qty_series) >= 4:
+                try:
+                    x = np.arange(len(qty_series))
+                    trend = np.polyfit(x, qty_series, 1)[0]
+                except:
+                    trend = 0
+            else:
+                trend = 0
+            
+            volatility = qty_series.std() if len(qty_series) > 1 else 0
+            
+            return pd.DataFrame({
+                'ma_3': [ma_3], 'ma_6': [ma_6], 'ma_12': [ma_12],
+                'consecutive_zeros': [consecutive_zeros], 'zero_weeks_12': [zero_weeks_12],
+                'trend': [trend], 'volatility': [volatility]
+            })
+        
+        features = weekly.groupby('Art').apply(compute_enhanced_features, include_groups=False).reset_index()
+        features = features.drop('level_1', axis=1, errors='ignore')
+        
+        # Доля магазинов без продаж
+        df['has_sales'] = df['Qty'] > 0
+        store_sales = df.groupby(['Art', 'Magazin'])['has_sales'].max().reset_index()
+        store_ratio = store_sales.groupby('Art')['has_sales'].mean().reset_index()
+        store_ratio['no_store_ratio'] = 1 - store_ratio['has_sales']
+        
+        # Объединение с ABC-анализом
+        features = features.merge(abc_analysis[['Art', 'total_qty', 'sales_velocity', 'abc_category', 'days_in_catalog']], on='Art', how='left')
+        features = features.merge(store_ratio[['Art', 'no_store_ratio']], on='Art', how='left')
+        
+        # Создание более сбалансированных лейблов по сегменту
+        def create_balanced_labels(row):
+            score = 0
+            
+            if row['abc_category'] == 'C':
+                if row['consecutive_zeros'] >= zero_weeks_threshold:
+                    score += 3
+                elif row['zero_weeks_12'] >= zero_weeks_threshold//2:
+                    score += 2
+                if row['no_store_ratio'] > max_store_ratio:
+                    score += 2
+                if row['total_qty'] < min_total_sales:
+                    score += 2
+                if row['trend'] < -0.1:
+                    score += 1
+            elif row['abc_category'] in ['A', 'B']:
+                if row['consecutive_zeros'] >= zero_weeks_threshold * 1.5:
+                    score += 2
+                if row['no_store_ratio'] > 0.95:
+                    score += 1
+            
+            return 1 if score >= 4 else 0
+        
+        features['label'] = features.apply(create_balanced_labels, axis=1)
+        
+        # Машинное обучение с балансировкой через class_weight
+        feature_cols = ['ma_3', 'ma_6', 'ma_12', 'consecutive_zeros', 'zero_weeks_12', 
+                       'trend', 'volatility', 'no_store_ratio', 'total_qty', 'sales_velocity']
+        
+        X = features[feature_cols].fillna(0)
+        y = features['label']
+        
+        st.write(f"**Распределение классов:** Снять: {y.sum()}, Оставить: {len(y) - y.sum()}")
+        
+        if len(y.unique()) > 1 and y.sum() > 0:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, random_state=42, test_size=0.3)
+            
+            # Используем только class_weight для балансировки
+            if use_balanced_model:
+                clf = RandomForestClassifier(
+                    n_estimators=50,  # Уменьшаем для экономии памяти
+                    random_state=42, 
+                    class_weight='balanced',
+                    max_depth=10,
+                    min_samples_split=5, 
+                    min_samples_leaf=2,
+                    n_jobs=1  # Ограничиваем количество потоков
+                )
+            else:
+                clf = RandomForestClassifier(
+                    n_estimators=50,
+                    random_state=42,
+                    max_depth=10,
+                    min_samples_split=5, 
+                    min_samples_leaf=2,
+                    n_jobs=1
+                )
+            
+            clf.fit(X_train, y_train)
+            features['prob_dying'] = clf.predict_proba(X)[:, 1]
+            train_score = clf.score(X_train, y_train)
+            test_score = clf.score(X_test, y_test)
+            
         else:
-            trend = 0
-        
-        volatility = qty_series.std() if len(qty_series) > 1 else 0
-        
-        return pd.DataFrame({
-            'ma_3': [ma_3], 'ma_6': [ma_6], 'ma_12': [ma_12],
-            'consecutive_zeros': [consecutive_zeros], 'zero_weeks_12': [zero_weeks_12],
-            'trend': [trend], 'volatility': [volatility]
-        })
-    
-    features = weekly.groupby('Art').apply(compute_enhanced_features, include_groups=False).reset_index()
-    features = features.drop('level_1', axis=1, errors='ignore')
-    
-    # Доля магазинов без продаж
-    df['has_sales'] = df['Qty'] > 0
-    store_sales = df.groupby(['Art', 'Magazin'])['has_sales'].max().reset_index()
-    store_ratio = store_sales.groupby('Art')['has_sales'].mean().reset_index()
-    store_ratio['no_store_ratio'] = 1 - store_ratio['has_sales']
-    
-    # Объединение с ABC-анализом
-    features = features.merge(abc_analysis[['Art', 'total_qty', 'sales_velocity', 'abc_category', 'days_in_catalog']], on='Art', how='left')
-    features = features.merge(store_ratio[['Art', 'no_store_ratio']], on='Art', how='left')
-    
-    # Создание более сбалансированных лейблов по сегменту
-    def create_balanced_labels(row):
-        score = 0
-        
-        if row['abc_category'] == 'C':
-            if row['consecutive_zeros'] >= zero_weeks_threshold:
-                score += 3
-            elif row['zero_weeks_12'] >= zero_weeks_threshold//2:
-                score += 2
-            if row['no_store_ratio'] > max_store_ratio:
-                score += 2
-            if row['total_qty'] < min_total_sales:
-                score += 2
-            if row['trend'] < -0.1:
-                score += 1
-        elif row['abc_category'] in ['A', 'B']:
-            if row['consecutive_zeros'] >= zero_weeks_threshold * 1.5:
-                score += 2
-            if row['no_store_ratio'] > 0.95:
-                score += 1
-        
-        return 1 if score >= 4 else 0
-    
-    features['label'] = features.apply(create_balanced_labels, axis=1)
-    
-    # Машинное обучение с балансировкой через class_weight
-    feature_cols = ['ma_3', 'ma_6', 'ma_12', 'consecutive_zeros', 'zero_weeks_12', 
-                   'trend', 'volatility', 'no_store_ratio', 'total_qty', 'sales_velocity']
-    
-    X = features[feature_cols].fillna(0)
-    y = features['label']
-    
-    st.write(f"**Распределение классов в выбранном сегменте:** Снять: {y.sum()}, Оставить: {len(y) - y.sum()}")
-    
-    if len(y.unique()) > 1 and y.sum() > 0:
-        X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, random_state=42, test_size=0.3)
-        
-        # Используем только class_weight для балансировки
-        if use_balanced_model:
-            clf = RandomForestClassifier(
-                n_estimators=100, 
-                random_state=42, 
-                class_weight='balanced',  # Автоматическая балансировка
-                max_depth=10,
-                min_samples_split=5, 
-                min_samples_leaf=2
-            )
-        else:
-            clf = RandomForestClassifier(
-                n_estimators=100, 
-                random_state=42,
-                max_depth=10,
-                min_samples_split=5, 
-                min_samples_leaf=2
-            )
-        
-        clf.fit(X_train, y_train)
-        features['prob_dying'] = clf.predict_proba(X)[:, 1]
-        train_score = clf.score(X_train, y_train)
-        test_score = clf.score(X_test, y_test)
-        
-    else:
-        st.warning("⚠️ Недостаточно разнообразных данных для обучения модели")
-        features['prob_dying'] = features['label'].astype(float)
-        train_score = test_score = 0.0
+            st.warning("⚠️ Недостаточно разнообразных данных для обучения модели")
+            features['prob_dying'] = features['label'].astype(float)
+            train_score = test_score = 0.0
+
+except Exception as e:
+    st.error(f"❌ Ошибка при обработке данных: {str(e)}")
+    st.stop()
 
 # === PROPHET ПРОГНОЗЫ ===
-with st.spinner("📈 Создание прогнозов Prophet..."):
-    qty_by_art = features.sort_values('total_qty', ascending=False).head(TOP_N)['Art']
-    forecast_dfs = []
-    
-    progress_bar = st.progress(0)
-    for i, art in enumerate(qty_by_art):
-        sales = df[df['Art'] == art].groupby('Data')[['Qty']].sum().reset_index()
-        if len(sales) < 8:
-            continue
-        
-        sales.columns = ['ds', 'y']
-        try:
-            model = Prophet(daily_seasonality=False, weekly_seasonality=True, 
-                          yearly_seasonality=True, changepoint_prior_scale=0.1)
-            model.fit(sales)
-            future = model.make_future_dataframe(periods=30)
-            forecast = model.predict(future)
-            median_30 = forecast.tail(30)['yhat'].median()
-            forecast_dfs.append({'Art': art, 'forecast_30_median': max(0, median_30)})
-        except:
-            continue
-        
-        progress_bar.progress((i + 1) / len(qty_by_art))
-    
-    forecast_df = pd.DataFrame(forecast_dfs)
+forecast_df = pd.DataFrame()
+
+if PROPHET_AVAILABLE:
+    try:
+        with st.spinner("📈 Создание прогнозов Prophet..."):
+            qty_by_art = features.sort_values('total_qty', ascending=False).head(min(TOP_N, 20))['Art']  # Ограничиваем до 20
+            forecast_dfs = []
+            
+            progress_bar = st.progress(0)
+            for i, art in enumerate(qty_by_art):
+                try:
+                    sales = df[df['Art'] == art].groupby('Data')[['Qty']].sum().reset_index()
+                    if len(sales) < 8:
+                        continue
+                    
+                    sales.columns = ['ds', 'y']
+                    model = Prophet(
+                        daily_seasonality=False, 
+                        weekly_seasonality=False,  # Отключаем для экономии ресурсов
+                        yearly_seasonality=False,
+                        changepoint_prior_scale=0.1,
+                        interval_width=0.8
+                    )
+                    model.fit(sales)
+                    future = model.make_future_dataframe(periods=30)
+                    forecast = model.predict(future)
+                    median_30 = forecast.tail(30)['yhat'].median()
+                    forecast_dfs.append({'Art': art, 'forecast_30_median': max(0, median_30)})
+                except:
+                    continue
+                
+                progress_bar.progress((i + 1) / len(qty_by_art))
+            
+            forecast_df = pd.DataFrame(forecast_dfs)
+    except Exception as e:
+        st.warning(f"⚠️ Ошибка создания прогнозов: {str(e)}")
+        forecast_df = pd.DataFrame()
+else:
+    st.info("ℹ️ Prophet недоступен. Прогнозы пропущены.")
 
 # === ФИНАЛЬНАЯ ТАБЛИЦА ===
-final = features.merge(forecast_df, on='Art', how='left')
+final = features.merge(forecast_df, on='Art', how='left') if not forecast_df.empty else features.copy()
+if 'forecast_30_median' not in final.columns:
+    final['forecast_30_median'] = np.nan
+
 final = final.merge(df[['Art', 'Name']].drop_duplicates(), on='Art', how='left')
 
 # Правила и рекомендации
@@ -351,7 +423,7 @@ def get_detailed_reason(row):
         reasons.append(f"В {(1-row['no_store_ratio'])*100:.0f}% магазинов")
     if row['total_qty'] < min_total_sales:
         reasons.append(f"Малый объем ({row['total_qty']:.1f})")
-    if pd.notnull(row['forecast_30_median']) and row['forecast_30_median'] < 0.5:
+    if pd.notnull(row.get('forecast_30_median')) and row['forecast_30_median'] < 0.5:
         reasons.append("Прогноз близок к нулю")
     if row['trend'] < -0.1:
         reasons.append("Негативный тренд")
@@ -438,45 +510,76 @@ if search_art:
 # === ТАБЛИЦА РЕЗУЛЬТАТОВ ===
 st.subheader(f"📋 Таблица результатов ({len(filtered_df)} товаров)")
 
-display_df = filtered_df[['Art', 'Name', 'abc_category', 'total_qty', 'consecutive_zeros', 
-                         'no_store_ratio', 'forecast_30_median', 'prob_dying', 
-                         'Причина', 'Рекомендация']].copy()
+display_columns = ['Art', 'Name', 'abc_category', 'total_qty', 'consecutive_zeros', 
+                  'no_store_ratio', 'prob_dying', 'Причина', 'Рекомендация']
+
+if 'forecast_30_median' in filtered_df.columns and not filtered_df['forecast_30_median'].isna().all():
+    display_columns.insert(-2, 'forecast_30_median')
+
+display_df = filtered_df[display_columns].copy()
 
 display_df['no_store_ratio'] = display_df['no_store_ratio'].round(2)
-display_df['forecast_30_median'] = display_df['forecast_30_median'].round(1)
+if 'forecast_30_median' in display_df.columns:
+    display_df['forecast_30_median'] = display_df['forecast_30_median'].round(1)
 display_df['prob_dying'] = display_df['prob_dying'].round(3)
 display_df['total_qty'] = display_df['total_qty'].round(1)
 
-display_df.columns = ['Артикул', 'Название', 'ABC', 'Общий_объем', 'Недель_без_продаж', 
-                     'Доля_маг_без_продаж', 'Прогноз_30дн', 'Вероятность_снятия', 'Причина', 'Рекомендация']
+column_names = ['Артикул', 'Название', 'ABC', 'Общий_объем', 'Недель_без_продаж', 
+               'Доля_маг_без_продаж']
+if 'forecast_30_median' in display_df.columns:
+    column_names.append('Прогноз_30дн')
+column_names.extend(['Вероятность_снятия', 'Причина', 'Рекомендация'])
+
+display_df.columns = column_names
 
 st.dataframe(display_df, use_container_width=True)
 
 # === ЭКСПОРТ ===
 st.subheader("💾 Экспорт результатов")
 
-if st.button("📥 Скачать результаты в Excel"):
-    output = final[['Art', 'Name', 'abc_category', 'total_qty', 'consecutive_zeros', 
-                   'no_store_ratio', 'forecast_30_median', 'prob_dying', 'Причина', 'Рекомендация']].copy()
-    
-    from io import BytesIO
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        output.to_excel(writer, sheet_name='Результаты', index=False)
+if st.button("📥 Подготовить файл для скачивания"):
+    try:
+        output_columns = ['Art', 'Name', 'abc_category', 'total_qty', 'consecutive_zeros', 
+                         'no_store_ratio', 'prob_dying', 'Причина', 'Рекомендация']
         
-        stats = pd.DataFrame({
-            'Метрика': ['Всего товаров', 'К снятию', 'Наблюдать', 'Оставить', 'Порог ML'],
-            'Значение': [total_products, candidates_remove, candidates_watch, 
-                        total_products - candidates_remove - candidates_watch, final_threshold]
-        })
-        stats.to_excel(writer, sheet_name='Статистика', index=False)
+        if 'forecast_30_median' in final.columns:
+            output_columns.insert(-2, 'forecast_30_median')
         
-        abc_summary = final.groupby(['abc_category', 'Рекомендация']).size().unstack(fill_value=0)
-        abc_summary.to_excel(writer, sheet_name='ABC_анализ')
+        output = final[output_columns].copy()
+        
+        from io import BytesIO
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            output.to_excel(writer, sheet_name='Результаты', index=False)
+            
+            stats = pd.DataFrame({
+                'Метрика': ['Всего товаров', 'К снятию', 'Наблюдать', 'Оставить', 'Порог ML'],
+                'Значение': [total_products, candidates_remove, candidates_watch, 
+                            total_products - candidates_remove - candidates_watch, final_threshold]
+            })
+            stats.to_excel(writer, sheet_name='Статистика', index=False)
+            
+            abc_summary = final.groupby(['abc_category', 'Рекомендация']).size().unstack(fill_value=0)
+            abc_summary.to_excel(writer, sheet_name='ABC_анализ')
+        
+        st.download_button(
+            label="📥 Скачать Excel",
+            data=buffer.getvalue(),
+            file_name="product_analysis_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        st.success("✅ Файл готов к скачиванию!")
+        
+    except Exception as e:
+        st.error(f"❌ Ошибка при создании файла: {str(e)}")
+
+# Добавляем информацию о системе
+with st.expander("ℹ️ Информация о системе"):
+    st.write("**Статус компонентов:**")
+    st.write(f"- Prophet: {'✅ Доступен' if PROPHET_AVAILABLE else '❌ Недоступен'}")
+    st.write(f"- Sklearn: ✅ Доступен")
+    st.write(f"- Pandas: ✅ Доступен")
+    st.write(f"- Обработано артикулов: {len(final) if 'final' in locals() else 0}")
     
-    st.download_button(
-        label="📥 Скачать Excel",
-        data=buffer.getvalue(),
-        file_name="product_analysis_by_segment.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    if not PROPHET_AVAILABLE:
+        st.warning("⚠️ Для полной функциональности установите Prophet: pip install prophet")
