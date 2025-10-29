@@ -210,12 +210,15 @@ def calculate_features(weekly, df):
         qty_series = sorted_group['Qty'].values
         
         if len(qty_series) == 0:
-            return pd.DataFrame({
-                'ma_3': [0], 'ma_6': [0], 'consecutive_zeros': [0],
-                'zero_weeks_12': [0], 'trend': [0]
+            return pd.Series({
+                'ma_3': 0, 
+                'ma_6': 0, 
+                'consecutive_zeros': 0,
+                'zero_weeks_12': 0, 
+                'trend': 0
             })
         
-        # Скользящие средние (исправлено: используем pandas Series)
+        # Скользящие средние
         qty_series_pd = pd.Series(qty_series)
         ma_3 = qty_series_pd.rolling(3, min_periods=1).mean().iloc[-1]
         ma_6 = qty_series_pd.rolling(6, min_periods=1).mean().iloc[-1]
@@ -231,7 +234,7 @@ def calculate_features(weekly, df):
         # Нули за последние 12 недель
         zero_weeks_12 = int(np.sum(qty_series[-12:] == 0)) if len(qty_series) >= 12 else int(np.sum(qty_series == 0))
         
-        # Тренд (исправлено: обработка исключений)
+        # Тренд
         trend = 0
         if len(qty_series) >= 4:
             try:
@@ -241,18 +244,18 @@ def calculate_features(weekly, df):
             except:
                 trend = 0
         
-        return pd.DataFrame({
-            'ma_3': [float(ma_3)], 
-            'ma_6': [float(ma_6)], 
-            'consecutive_zeros': [int(consecutive_zeros)],
-            'zero_weeks_12': [int(zero_weeks_12)], 
-            'trend': [float(trend)]
+        return pd.Series({
+            'ma_3': float(ma_3), 
+            'ma_6': float(ma_6), 
+            'consecutive_zeros': int(consecutive_zeros),
+            'zero_weeks_12': int(zero_weeks_12), 
+            'trend': float(trend)
         })
     
-    features = weekly.groupby('Art', group_keys=False).apply(compute_features).reset_index()
-    features = features.drop('level_1', axis=1, errors='ignore')
+    # Применяем функцию и получаем DataFrame с Art в индексе
+    features = weekly.groupby('Art').apply(compute_features, include_groups=False).reset_index()
     
-    # Расчет доли магазинов без продаж (исправлено)
+    # Расчет доли магазинов без продаж
     total_stores = df['Magazin'].nunique()
     
     if total_stores == 0:
@@ -265,7 +268,7 @@ def calculate_features(weekly, df):
     stores_with_sales['no_store_ratio'] = 1 - (stores_with_sales['stores_with_sales'] / total_stores)
     
     features = features.merge(stores_with_sales[['Art', 'no_store_ratio']], on='Art', how='left')
-    features['no_store_ratio'] = features['no_store_ratio'].fillna(1.0)  # Если нет продаж - все магазины без продаж
+    features['no_store_ratio'] = features['no_store_ratio'].fillna(1.0)
     
     return features
 
