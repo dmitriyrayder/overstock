@@ -273,10 +273,11 @@ def calculate_features(weekly, df):
     return features
 
 def create_ml_model(features, abc_analysis):
-    # Создание меток для обучения (исправлено: более точная логика)
+    # Создание меток для обучения (ИСПРАВЛЕННАЯ ЛОГИКА)
     def create_labels(row):
         score = 0
         
+        # Категория C - агрессивные критерии
         if row['abc_category'] == 'C':
             if row['consecutive_zeros'] >= zero_weeks_threshold: 
                 score += 3
@@ -291,12 +292,33 @@ def create_ml_model(features, abc_analysis):
             
             if row['trend'] < -0.1: 
                 score += 1
-                
-        elif row['abc_category'] in ['A', 'B']:
-            if row['consecutive_zeros'] >= zero_weeks_threshold * 1.5: 
+        
+        # Категория B - умеренные критерии (ИСПРАВЛЕНО)
+        elif row['abc_category'] == 'B':
+            if row['consecutive_zeros'] >= zero_weeks_threshold * 2:  # 24 недели
+                score += 3
+            elif row['consecutive_zeros'] >= zero_weeks_threshold:  # 12 недель
                 score += 2
-            if row['no_store_ratio'] > 0.95: 
+            
+            if row['no_store_ratio'] > max_store_ratio:  # 85%
+                score += 2
+            
+            if row['total_qty'] < min_total_sales * 2:  # 10 единиц
                 score += 1
+            
+            if row['trend'] < -0.1:
+                score += 1
+        
+        # Категория A - только критичные случаи
+        elif row['abc_category'] == 'A':
+            if row['consecutive_zeros'] >= zero_weeks_threshold * 3:  # 36 недель
+                score += 2
+            if row['no_store_ratio'] > 0.95:  # 95%
+                score += 1
+        
+        # Критичные случаи для ЛЮБОЙ категории
+        if row['consecutive_zeros'] >= zero_weeks_threshold * 2 and row['no_store_ratio'] > max_store_ratio:
+            score += 2  # Усиление для комбинации факторов
         
         return 1 if score >= 4 else 0
     
@@ -316,7 +338,7 @@ def create_ml_model(features, abc_analysis):
     st.write(f"**Распределение:** Снять: {y.sum()}, Оставить: {len(y) - y.sum()}")
     
     # Проверка возможности обучения
-    if len(y.unique()) > 1 and y.sum() >= 2:  # Минимум 2 экземпляра для снятия
+    if len(y.unique()) > 1 and y.sum() >= 2:
         try:
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, 
@@ -397,8 +419,12 @@ def get_recommendations(row):
     
     if row['abc_category'] == 'C': 
         reasons.append("Категория C")
+    elif row['abc_category'] == 'B':
+        reasons.append("Категория B")
     
-    if row['consecutive_zeros'] >= zero_weeks_threshold: 
+    if row['consecutive_zeros'] >= zero_weeks_threshold * 2:
+        reasons.append(f"Без продаж {int(row['consecutive_zeros'])} недель (критично!)")
+    elif row['consecutive_zeros'] >= zero_weeks_threshold: 
         reasons.append(f"Без продаж {int(row['consecutive_zeros'])} недель")
     
     if row['zero_weeks_12'] >= zero_weeks_threshold // 2: 
@@ -410,6 +436,8 @@ def get_recommendations(row):
     
     if row['total_qty'] < min_total_sales: 
         reasons.append(f"Малый объем ({row['total_qty']:.1f})")
+    elif row['total_qty'] < min_total_sales * 2:
+        reasons.append(f"Низкий объем ({row['total_qty']:.1f})")
     
     if row['trend'] < -0.1: 
         reasons.append("Негативный тренд")
@@ -421,19 +449,45 @@ def get_recommendations(row):
     
     reason = "; ".join(reasons) if reasons else "Стабильные продажи"
     
-    # Рекомендация (исправлено: порог в процентах)
-    prob_threshold_pct = final_threshold * 100
+    # КРИТИЧНЫЕ СЛУЧАИ - переопределение независимо от ML
+    # 1. Экстремально долгое отсутствие продаж
+    if row['consecutive_zeros'] >= zero_weeks_threshold * 3:  # 36 недель
+        return reason, "🚫 Снять"
     
+    # 2. Категория C с превышением всех порогов
     if (row['abc_category'] == 'C' and 
         row['consecutive_zeros'] >= zero_weeks_threshold and 
-        row['total_qty'] < min_total_sales):
+        row['total_qty'] < min_total_sales and
+        row['no_store_ratio'] > max_store_ratio):
         return reason, "🚫 Снять"
-    elif row['prob_dying'] > prob_threshold_pct:
+    
+    # 3. Категория B с критическими показателями
+    if (row['abc_category'] == 'B' and 
+        row['consecutive_zeros'] >= zero_weeks_threshold * 2 and 
+        row['no_store_ratio'] > max_store_ratio):
+        return reason, "🚫 Снять"
+    
+    # 4. Долгое отсутствие + низкое распространение для B
+    if (row['abc_category'] == 'B' and
+        row['consecutive_zeros'] >= zero_weeks_threshold * 1.5 and
+        row['no_store_ratio'] > 0.85 and
+        row['total_qty'] < min_total_sales * 2):
+        return reason, "⚠️ Наблюдать"
+    
+    # Стандартная логика на основе ML
+    prob_threshold_pct = final_threshold * 100
+    
+    if row['prob_dying'] > prob_threshold_pct:
         return reason, "🚫 Снять"
     elif row['prob_dying'] > prob_threshold_pct * 0.7:
         return reason, "⚠️ Наблюдать"
-    else:
-        return reason, "✅ Оставить"
+    
+    # Дополнительные проверки для "Наблюдать"
+    if (row['consecutive_zeros'] >= zero_weeks_threshold and 
+        row['no_store_ratio'] > 0.75):
+        return reason, "⚠️ Наблюдать"
+    
+    return reason, "✅ Оставить"
 
 # Выполнение анализа
 df, weekly, all_arts, unique_weeks = process_data(df)
